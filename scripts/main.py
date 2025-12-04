@@ -42,8 +42,6 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.model_selection import train_test_split
-from scipy.ndimage import gaussian_filter1d
-from scipy.interpolate import UnivariateSpline
 import plotly.graph_objs as go
 import plotly.io as pio
 
@@ -259,7 +257,7 @@ def create_regressor(random_state: int = RANDOM_SEED) -> Any:
     if REGRESSOR_TYPE == "xgboost":
         model = xgb.XGBRegressor(
             n_estimators=300,
-            max_depth=6,
+            max_depth=3,
             learning_rate=0.05,
             objective="reg:squarederror",
             verbosity=0,
@@ -269,7 +267,7 @@ def create_regressor(random_state: int = RANDOM_SEED) -> Any:
         model = GradientBoostingRegressor(
             n_estimators=300,
             learning_rate=0.05,
-            max_depth=6,
+            max_depth=3,
             random_state=random_state,
         )
     return model
@@ -513,62 +511,6 @@ def apply_physics_constraints(predictions: np.ndarray) -> np.ndarray:
     # Apply non-negativity constraint
     constrained = np.maximum(predictions, MIN_POWER_THRESHOLD)
     return constrained
-
-
-def smooth_predictions(
-    speed_grid: np.ndarray,
-    predictions: np.ndarray,
-    method: str = "spline",
-    smoothing_factor: float = 0.1
-) -> np.ndarray:
-    """
-    Smooth predictions to create smooth curves instead of zigzag patterns.
-
-    Tree-based models (XGBoost, GBR) produce step-like predictions. This
-    function applies smoothing to create physically realistic smooth curves.
-
-    Args:
-        speed_grid: Array of speed values (x-axis).
-        predictions: Array of raw predictions to smooth.
-        method: Smoothing method - "spline", "gaussian", or "polynomial".
-        smoothing_factor: Controls smoothness (higher = smoother).
-
-    Returns:
-        np.ndarray: Smoothed predictions.
-    """
-    if method == "spline":
-        # Univariate spline fitting - produces smooth cubic-like curves
-        # s parameter controls smoothness (higher = smoother)
-        s_value = len(predictions) * smoothing_factor
-        try:
-            spline = UnivariateSpline(speed_grid, predictions, s=s_value, k=3)
-            smoothed = spline(speed_grid)
-        except Exception:
-            # Fallback to gaussian if spline fails
-            smoothed = gaussian_filter1d(predictions, sigma=5)
-    
-    elif method == "gaussian":
-        # Gaussian filter smoothing
-        sigma = max(1, int(len(predictions) * smoothing_factor / 10))
-        smoothed = gaussian_filter1d(predictions, sigma=sigma)
-    
-    elif method == "polynomial":
-        # Polynomial fit (cubic)
-        coeffs = np.polyfit(speed_grid, predictions, deg=3)
-        smoothed = np.polyval(coeffs, speed_grid)
-    
-    else:
-        smoothed = predictions
-    
-    # Ensure smoothed predictions are non-negative
-    smoothed = np.maximum(smoothed, MIN_POWER_THRESHOLD)
-    
-    # Ensure monotonicity (power should increase with speed)
-    for i in range(1, len(smoothed)):
-        if smoothed[i] < smoothed[i-1]:
-            smoothed[i] = smoothed[i-1]
-    
-    return smoothed
 
 
 def print_physics_losses(losses: Dict[str, float]) -> None:
@@ -825,7 +767,7 @@ def create_main_figure(
         y=train_laden["power_obs"],
         mode="markers",
         name="Train - Laden",
-        marker=dict(size=6, symbol="circle", opacity=0.7, color="blue"),
+        marker=dict(size=6, symbol="circle", opacity=0.7, color="red"),
         hovertemplate="Speed: %{x:.2f} kn<br>Power: %{y:.2f} kW<br>Laden<extra></extra>",
     )
 
@@ -835,7 +777,7 @@ def create_main_figure(
         y=train_ballast["power_obs"],
         mode="markers",
         name="Train - Ballast",
-        marker=dict(size=6, symbol="circle", opacity=0.7, color="lightblue"),
+        marker=dict(size=6, symbol="circle", opacity=0.7, color="blue"),
         hovertemplate="Speed: %{x:.2f} kn<br>Power: %{y:.2f} kW<br>Ballast<extra></extra>",
     )
 
@@ -875,7 +817,7 @@ def create_main_figure(
         y=final_grid_laden,
         mode="lines",
         name="PIML - Laden",
-        line=dict(width=3, color="darkgreen"),
+        line=dict(width=3, color="darkred"),
         hovertemplate="Speed: %{x:.2f} kn<br>Predicted: %{y:.2f} kW<br>Laden<extra></extra>",
     )
 
@@ -885,7 +827,7 @@ def create_main_figure(
         y=final_grid_ballast,
         mode="lines",
         name="PIML - Ballast",
-        line=dict(width=3, color="lightgreen"),
+        line=dict(width=3, color="darkblue"),
         hovertemplate="Speed: %{x:.2f} kn<br>Predicted: %{y:.2f} kW<br>Ballast<extra></extra>",
     )
 
@@ -1125,23 +1067,16 @@ def main() -> None:
     res_grid_laden = model.predict(X_grid_laden)
     res_grid_ballast = model.predict(X_grid_ballast)
 
-    final_grid_laden_raw = grid_df_laden["phys_base"].values + res_grid_laden
-    final_grid_ballast_raw = grid_df_ballast["phys_base"].values + res_grid_ballast
+    final_grid_laden = grid_df_laden["phys_base"].values + res_grid_laden
+    final_grid_ballast = grid_df_ballast["phys_base"].values + res_grid_ballast
 
-    # Apply smoothing to get smooth cubic-like curves
-    print("      Applying curve smoothing...")
-    final_grid_laden = smooth_predictions(
-        grid_df_laden["speed"].values,
-        final_grid_laden_raw,
-        method="spline",
-        smoothing_factor=0.05
-    )
-    final_grid_ballast = smooth_predictions(
-        grid_df_ballast["speed"].values,
-        final_grid_ballast_raw,
-        method="spline",
-        smoothing_factor=0.05
-    )
+    # Smooth the curves for visualization (remove tree-based zigzags)
+    # Since physics is cubic, fitting a 3rd degree polynomial preserves the trend while smoothing
+    z_laden = np.polyfit(grid_df_laden["speed"], final_grid_laden, 3)
+    final_grid_laden = np.polyval(z_laden, grid_df_laden["speed"])
+
+    z_ballast = np.polyfit(grid_df_ballast["speed"], final_grid_ballast, 3)
+    final_grid_ballast = np.polyval(z_ballast, grid_df_ballast["speed"])
 
     # Create main figure with separate curves
     fig_main = create_main_figure(
